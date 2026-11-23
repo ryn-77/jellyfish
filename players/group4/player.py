@@ -32,6 +32,7 @@ class Player4(Player):
     _SAMPLES = 20
     _CENTERS = 56
     _CENTER_MASK = 68
+    _BORN_BREEDING = 69
     _VELOCITIES = 70
 
     @staticmethod
@@ -185,22 +186,42 @@ class Player4(Player):
         # child, so the child can use that position as its new local origin.
         birth_day = snapshot.birth_day_of_year
         birth_year = snapshot.birth_year
+        just_initialized = False
         if (
             memory[self._MAGIC] != 0xA4
             or memory[self._BIRTH_DAY] != birth_day & 0xFF
             or memory[self._BIRTH_YEAR] != birth_year & 0xFF
         ):
+            just_initialized = True
+            # The inherited map is relative to the parent's birth origin.
+            # Rebase known centers around the child's birth position before
+            # resetting the child's own local coordinates.
+            parent_x = self._read_i16(memory, self._X)
+            parent_y = self._read_i16(memory, self._Y)
+            inherited_mask = memory[self._CENTER_MASK]
+            inherited_centers = [
+                (
+                    self._read_i16(memory, self._CENTERS + zone * 4),
+                    self._read_i16(memory, self._CENTERS + zone * 4 + 2),
+                )
+                for zone in range(3)
+            ]
             # The inherited estimate is the child's birth location.  Reset
-            # only the local coordinates; inherited map/statistic bytes stay
-            # available for later extensions.
+            # local coordinates and rebase the inherited center map.
             self._write_i16(memory, self._X, 0)
             self._write_i16(memory, self._Y, 0)
+            for zone, (cx, cy) in enumerate(inherited_centers):
+                if inherited_mask & (1 << zone):
+                    center = self._CENTERS + zone * 4
+                    self._write_i16(memory, center, self._wrap(cx - parent_x))
+                    self._write_i16(memory, center + 2, self._wrap(cy - parent_y))
+            memory[self._CENTER_MASK] = inherited_mask
             memory[self._BIRTH_DAY] = birth_day & 0xFF
             memory[self._BIRTH_YEAR] = birth_year & 0xFF
             self._write_i16(memory, self._LAST_DX, round(snapshot.velocity[0] * 10))
             self._write_i16(memory, self._LAST_DY, round(snapshot.velocity[1] * 10))
             memory[self._MAGIC] = 0xA4
-            for i in range(self._PREV_FLAGS, self._CENTER_MASK + 1):
+            for i in range(self._PREV_FLAGS, self._CENTERS):
                 memory[i] = 0
         else:
             # The previous action's current carried the jellyfish between
@@ -226,10 +247,11 @@ class Player4(Player):
         x = self._read_i16(memory, self._X)
         y = self._read_i16(memory, self._Y)
         old_flags = memory[self._PREV_FLAGS]
-        for zone in range(3):
-            bit = 1 << zone
-            if (flags & bit) != (old_flags & bit):
-                self._record_boundary(memory, zone, x, y)
+        if not just_initialized:
+            for zone in range(3):
+                bit = 1 << zone
+                if (flags & bit) != (old_flags & bit):
+                    self._record_boundary(memory, zone, x, y)
         memory[self._PREV_FLAGS] = flags
 
         if snapshot.in_feeding_zone:
@@ -262,11 +284,15 @@ class Player4(Player):
             target_zone = 0 if snapshot.season in (Season.SPRING, Season.SUMMER) else 1
             depth = self._route_depth(memory, snapshot.depth, x, y, target_zone)
             if depth is None:
-                # Before a center is known, rotate through currents so we
-                # learn every heading and can later retrace a useful route.
-                probe = memory[15] % 4
-                depth = Depth(probe)
-                memory[15] = (probe + 1) % 4
+                # Initial jellyfish are born inside breeding, so their birth
+                # origin is a useful fallback target before its center is
+                # mapped. Later generations use normal probing.
+                if target_zone == 1 and birth_day == 1 and birth_year == 1:
+                    depth = self._best_route_depth(memory, snapshot.depth, -x, -y)
+                else:
+                    probe = memory[15] % 4
+                    depth = Depth(probe)
+                    memory[15] = (probe + 1) % 4
             eat = snapshot.season == Season.SUMMER and snapshot.in_feeding_zone
             reproduce = snapshot.season == Season.WINTER and snapshot.in_breeding_zone
 
